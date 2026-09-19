@@ -6,6 +6,7 @@ package lobby
 
 import (
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/zeror5162-creator/cossacs/server/internal/protocol"
@@ -94,6 +95,122 @@ func (s *Server) handle(c Client, p protocol.Packet) {
 			s.forward(p, id, 0x197, toSource)
 			s.forward(p, id, 0x197, toID2)
 		}
+
+	// кімнати
+	case 0x19c:
+		r := protocol.NewReader(p.Body)
+		r.Skip(5)
+		desc := r.String(protocol.LenByte)
+		info := r.String(protocol.LenByte)
+		magic := r.Int()
+		if r.Err() != nil {
+			return
+		}
+		pl := s.players[id]
+		if pl.Room != nil {
+			return // вже в кімнаті
+		}
+		room := NewRoom(id, desc)
+		s.rooms[id] = room
+		pl.JoinRoom(room)
+
+		w := protocol.NewWriter()
+		w.Byte(7)
+		w.Int(8)
+		w.String(desc, protocol.LenByte)
+		w.String(info, protocol.LenByte)
+		w.Int(magic)
+		w.Short(0)
+		s.send(w.Packet(0x19d, p.ID1, 0), id, toEveryone)
+
+	case 0x19e:
+		r := protocol.NewReader(p.Body)
+		hostID := r.Int()
+		if r.Err() != nil {
+			return
+		}
+		room, ok := s.rooms[hostID]
+		if !ok {
+			return
+		}
+		pl := s.players[id]
+		if pl.Room != nil {
+			return
+		}
+		pl.JoinRoom(room)
+
+		w := protocol.NewWriter()
+		w.Int(hostID)
+		w.Byte(pl.Status)
+		s.send(w.Packet(0x19f, p.ID1, 0), id, toEveryone)
+
+	case 0x1a0:
+		s.leaveRoom(c, p)
+
+	case 0x1a2:
+		pl := s.players[id]
+		if pl.Room == nil {
+			return
+		}
+		room := pl.Room
+		room.Hidden = true
+		w := protocol.NewWriter()
+		w.Int(uint32(len(room.Players)))
+		for i := len(room.Players) - 1; i >= 0; i-- {
+			pid := room.Players[i]
+			other := s.players[pid]
+			if pid == id {
+				other.Status = StatusGameHost
+			} else {
+				other.Status = StatusInGame
+			}
+			w.Int(pid)
+			w.Byte(other.Status)
+		}
+		s.send(w.Packet(0x1a3, p.ID1, 0), id, toEveryone)
+
+	case 0x1aa:
+		r := protocol.NewReader(p.Body)
+		desc := r.String(protocol.LenByte)
+		info := r.String(protocol.LenByte)
+		if r.Err() != nil {
+			return
+		}
+		pl := s.players[id]
+		if pl.Room == nil {
+			return
+		}
+		room := pl.Room
+		room.Info = info
+
+		w := protocol.NewWriter()
+		w.Int(8)
+		w.String(desc, protocol.LenByte)
+		w.String(info, protocol.LenByte)
+		w.Int(0)
+		w.Short(0)
+		w.Int(uint32(len(room.Players)))
+		for i := len(room.Players) - 1; i >= 0; i-- {
+			pid := room.Players[i]
+			w.Int(pid)
+			w.Byte(s.players[pid].Status)
+		}
+		s.send(w.Packet(0x1a5, p.ID1, 0), id, toEveryone)
+
+	case 0x1b5:
+		r := protocol.NewReader(p.Body)
+		kickID := r.Int()
+		if r.Err() != nil {
+			return
+		}
+		s.forward(p, id, 0x1b6, toEveryone)
+
+		w := protocol.NewWriter()
+		w.Byte(0)
+		w.Int(1)
+		w.Int(kickID)
+		w.Byte(1)
+		s.send(w.Packet(0x1a1, kickID, 0), id, toEveryone)
 
 	// логін і профіль
 	case 0x19a:
@@ -226,4 +343,90 @@ func (s *Server) handleLogin(c Client, p protocol.Packet) {
 	s.send(n.Packet(0x1a6, id, 0), id, toEveryone)
 
 	slog.Info("login", "server", s.Name, "id", id, "nick", pl.Name, "addr", c.Addr())
+}
+
+// leaveRoom обробляє 0x1a0 і використовується при розриві з'єднання.
+func (s *Server) leaveRoom(c Client, p protocol.Packet) {
+	id := c.ID()
+	pl, ok := s.players[id]
+	if !ok || pl.Room == nil {
+		// вихід хоста провокує 0x1a0 від інших гравців — їх ігноруємо
+		return
+	}
+	room := pl.Room
+	roomID := room.HostID
+	players := append([]uint32(nil), room.Players...)
+	status := pl.Status
+
+	hostLeaving := status == StatusRoomHost || status == StatusGameHost
+	transferNeeded := status == StatusGameHost && len(players) > 1
+	newHostID := players[len(players)-1]
+
+	w := protocol.NewWriter()
+	if hostLeaving {
+		w.Byte(1)
+		w.Int(uint32(len(players)))
+		for _, pid := range players {
+			other := s.players[pid]
+			other.LeaveRoom()
+			w.Int(pid)
+			w.Byte(other.Status)
+		}
+	} else {
+		pl.LeaveRoom()
+		w.Byte(0)
+		w.Int(1)
+		w.Int(pl.ID)
+		w.Byte(pl.Status)
+	}
+	s.send(w.Packet(0x1a1, p.ID1, 0), id, toEveryone)
+
+	if transferNeeded {
+		s.sendHostTransfer(id, room, players, newHostID)
+	}
+	if hostLeaving {
+		delete(s.rooms, roomID)
+	}
+}
+
+// sendHostTransfer шле 0x1bd новому хосту й 0x1be решті гравців.
+func (s *Server) sendHostTransfer(srcID uint32, room *Room, players []uint32, newHostID uint32) {
+	w := protocol.NewWriter()
+	w.Int(0) // місце під довжину блоку, перезапишемо в кінці
+	w.Int(0)
+	w.Int(1)
+	w.Byte(0)
+	w.Int(6)
+
+	pair := func(k, v string) {
+		w.String(k, protocol.LenInt)
+		w.String(v, protocol.LenInt)
+		w.Int(0)
+	}
+	pair("gamename", room.Desc)
+	pair("mapname", room.Info)
+	pair("master", strconv.FormatUint(uint64(newHostID), 10))
+	pair("session", "1337")
+	pair("clients", strconv.Itoa(len(players)-1))
+
+	w.String("clientslist", protocol.LenInt)
+	w.Int(1)
+	w.Byte(0)
+	w.Int(uint32(len(players) - 1))
+	for _, pid := range players[1:] {
+		w.String("*", protocol.LenInt)
+		w.String(strconv.FormatUint(uint64(pid), 10), protocol.LenInt)
+	}
+	w.Int(0)
+
+	// перший int тіла = довжина решти тіла
+	w.PatchInt(0, uint32(w.Len()-4))
+	s.send(w.Packet(0x1bd, newHostID, newHostID), srcID, toID2)
+
+	for _, pid := range players[1:] {
+		if pid == newHostID {
+			continue
+		}
+		s.send(protocol.Packet{Cmd: 0x1be, ID1: newHostID, ID2: pid}, srcID, toID2)
+	}
 }
