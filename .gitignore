@@ -1,0 +1,4 @@
+reference/
+*.exe
+*.db
+config.toml
