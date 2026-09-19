@@ -1,0 +1,22 @@
+[Unit]
+Description=c3hub - Cossacks 3 lobby server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=c3hub
+Group=c3hub
+WorkingDirectory=/opt/c3hub
+ExecStart=/opt/c3hub/c3hub -config /etc/c3hub/config.toml
+Restart=always
+RestartSec=5
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/c3hub
+
+[Install]
+WantedBy=multi-user.target

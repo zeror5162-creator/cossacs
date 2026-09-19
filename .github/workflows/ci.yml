@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: server/go.sum
+
+      - name: Unit tests
+        working-directory: server
+        run: go test ./... -count=1
+
+      - name: Race detector
+        working-directory: server
+        run: go test ./internal/lobby/ ./internal/netsrv/ -race -count=1
+
+      - name: Build reference C++ server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libasio-dev
+          git clone --depth 1 https://github.com/ereb-thanatos/cossacks3-lan-server.git /tmp/ref
+          g++ /tmp/ref/src/*.cpp -DNDEBUG -DASIO_STANDALONE -O2 -pthread -o /tmp/ref-server
+
+      - name: Run reference server
+        run: |
+          /tmp/ref-server &
+          # Чекаємо, поки з'явиться слухач, замість сліпого sleep. Саме
+          # чекаємо, а не під'єднуємось: еталон видає id кожному сокету й
+          # не скидає лічильник, тож пробне з'єднання з'їло б id 1, і
+          # parity-тест вирішив би, що сервер не щойно запущений.
+          for _ in $(seq 1 50); do
+            if ss -ltn 'sport = :31523' | grep -q LISTEN; then break; fi
+            sleep 0.2
+          done
+          ss -ltn 'sport = :31523'
+
+      - name: Parity test
+        working-directory: server
+        env:
+          C3_REFERENCE_ADDR: 127.0.0.1:31523
+        run: go test ./internal/paritytest/ -v -count=1
+
+      - name: Cross-compile for ARM64
+        working-directory: server
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: go build -o /tmp/c3hub ./cmd/c3hub

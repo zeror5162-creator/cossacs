@@ -1,0 +1,13 @@
+data_dir = "/var/lib/c3hub"
+
+[[server]]
+name = "Основний"
+port = 31523
+max_conn_per_ip = 4
+description = "Головний сервер спільноти"
+
+[[server]]
+name = "Тестовий"
+port = 31524
+max_conn_per_ip = 4
+description = "Для перевірок перед оновленням"
