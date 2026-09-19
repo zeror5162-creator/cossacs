@@ -58,6 +58,28 @@ func (s *Server) Connect(c Client) {
 	slog.Info("client connected", "server", s.Name, "id", s.lastID, "addr", c.Addr())
 }
 
+// Disconnect прибирає клієнта з лобі: спершу з реєстру (щоб не слати
+// пакети мертвому сокету), потім з кімнати, потім сповіщає решту.
+func (s *Server) Disconnect(c Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := c.ID()
+	delete(s.clients, id)
+	slog.Info("client disconnected", "server", s.Name, "id", id, "addr", c.Addr())
+
+	pl, ok := s.players[id]
+	if !ok {
+		return // розрив до логіну
+	}
+	if pl.Room != nil {
+		s.leaveRoom(c, protocol.Packet{Cmd: 0x1a0, ID1: id})
+	}
+	delete(s.players, id)
+
+	s.send(protocol.Packet{Cmd: 0x1a7, ID1: id}, id, toEveryone)
+}
+
 // sortedClientIDs повертає id клієнтів за зростанням — як std::map в оригіналі.
 func (s *Server) sortedClientIDs() []uint32 {
 	ids := make([]uint32, 0, len(s.clients))
