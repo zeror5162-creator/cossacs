@@ -36,6 +36,14 @@ func TestParityWithReferenceServer(t *testing.T) {
 		t.Fatalf("go run: %v", err)
 	}
 
+	// Обидва сервери видають id з одиниці, але лічильник еталона не
+	// скидається між прогонами. Порівняння байт у байт має сенс лише
+	// для щойно запущеного еталона.
+	if p := refPackets["host"]; len(p) == 0 || p[0].ID1 != 1 {
+		t.Fatalf("reference server is not freshly started (first id = %v); restart it before running parity",
+			firstID(refPackets["host"]))
+	}
+
 	for _, name := range []string{"host", "guest1", "guest2"} {
 		want, got := refPackets[name], gotPackets[name]
 		if len(want) != len(got) {
@@ -64,4 +72,11 @@ func dump(ps []protocol.Packet) string {
 		out += fmt.Sprintf("%#x ", p.Cmd)
 	}
 	return out
+}
+
+func firstID(ps []protocol.Packet) any {
+	if len(ps) == 0 {
+		return "no packets"
+	}
+	return ps[0].ID1
 }
