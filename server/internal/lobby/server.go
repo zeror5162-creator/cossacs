@@ -188,3 +188,11 @@ func (s *Server) playerForTest(id uint32) *Player {
 	defer s.mu.Unlock()
 	return s.players[id]
 }
+
+// HasPlayer каже, чи завершив клієнт логін.
+func (s *Server) HasPlayer(id uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.players[id]
+	return ok
+}

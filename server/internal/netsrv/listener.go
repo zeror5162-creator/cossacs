@@ -16,8 +16,13 @@ import (
 
 type Options struct {
 	LoginTimeout time.Duration // 0 → 30s
-	SendQueue    int           // 0 → 64
-	MaxConnPerIP int           // 0 → 4; -1 → без обмеження
+	SendQueue    int           // 0 → 64 (кількість пакетів)
+	// SendQueueBytes обмежує чергу надсилань у байтах (0 → 8 МіБ).
+	// Кількості пакетів замало: один пакет може важити до 1 МіБ, тож
+	// клієнт із повільним каналом інакше або з'їдає пам'ять, або його
+	// рвуть через чужий флуд.
+	SendQueueBytes int
+	MaxConnPerIP   int // 0 → 4; -1 → без обмеження
 }
 
 type Listener struct {
@@ -36,6 +41,9 @@ func Listen(ctx context.Context, addr string, lb *lobby.Server, opts Options) (*
 	}
 	if opts.SendQueue == 0 {
 		opts.SendQueue = 64
+	}
+	if opts.SendQueueBytes == 0 {
+		opts.SendQueueBytes = 8 << 20
 	}
 	if opts.MaxConnPerIP == 0 {
 		opts.MaxConnPerIP = 4
@@ -107,6 +115,9 @@ type session struct {
 	out      chan []byte
 	closeOne sync.Once
 	done     chan struct{}
+
+	qmu    sync.Mutex
+	queued int // байтів у черзі надсилань
 }
 
 func newSession(conn net.Conn, lb *lobby.Server, opts Options) *session {
@@ -123,7 +134,19 @@ func (s *session) SetID(id uint32) { s.id = id }
 func (s *session) Addr() string    { return s.addr }
 
 // Send не блокує лобі: якщо клієнт не встигає читати, з'єднання рветься.
+// Черга обмежена і за кількістю пакетів, і за обсягом у байтах.
 func (s *session) Send(b []byte) {
+	s.qmu.Lock()
+	if s.queued+len(b) > s.opts.SendQueueBytes {
+		s.qmu.Unlock()
+		slog.Warn("send queue overflow (bytes)", "addr", s.addr, "id", s.id,
+			"queued", s.queued)
+		s.Close()
+		return
+	}
+	s.queued += len(b)
+	s.qmu.Unlock()
+
 	select {
 	case s.out <- b:
 	default:
@@ -151,8 +174,7 @@ func (s *session) run() {
 	s.lobby.Connect(s)
 	go s.writeLoop()
 
-	deadline := time.Now().Add(s.opts.LoginTimeout)
-	_ = s.conn.SetReadDeadline(deadline)
+	_ = s.conn.SetReadDeadline(time.Now().Add(s.opts.LoginTimeout))
 	authed := false
 
 	for {
@@ -163,11 +185,13 @@ func (s *session) run() {
 			}
 			return
 		}
-		if !authed {
+		s.lobby.Handle(s, p)
+		// Таймаут знімається лише після справжнього логіну, а не після
+		// будь-якого пакета: інакше сканер тримає сокет одним байтом.
+		if !authed && s.lobby.HasPlayer(s.id) {
 			authed = true
 			_ = s.conn.SetReadDeadline(time.Time{})
 		}
-		s.lobby.Handle(s, p)
 		select {
 		case <-s.done:
 			return
@@ -182,6 +206,9 @@ func (s *session) writeLoop() {
 		case <-s.done:
 			return
 		case b := <-s.out:
+			s.qmu.Lock()
+			s.queued -= len(b)
+			s.qmu.Unlock()
 			if _, err := s.conn.Write(b); err != nil {
 				slog.Debug("write error", "addr", s.addr, "id", s.id, "err", err)
 				s.Close()

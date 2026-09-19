@@ -12,6 +12,9 @@ import (
 	"github.com/zeror5162-creator/cossacs/server/internal/protocol"
 )
 
+// maxTextPacket — стеля для чат-пакетів (0x194/0x196).
+const maxTextPacket = 1024
+
 const allowedNickChars = "abcdefghijklmnopqrstuvwxyz" +
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789()+-_.[]"
 
@@ -83,9 +86,19 @@ func (s *Server) handle(c Client, p protocol.Packet) {
 		s.forward(p, id, 0x1bc, toEveryoneInRoom)
 
 	// чат
-	case 0x194:
-		s.forward(p, id, 0x195, toEveryoneInRoom)
-	case 0x196:
+	case 0x194, 0x196:
+		// Рядок у цих пакетах має 1-байтний префікс довжини, тож усе,
+		// більше за maxTextPacket, справжній клієнт надіслати не може.
+		// Без обмеження один гравець розсилає всім по мегабайту.
+		if len(p.Body) > maxTextPacket {
+			slog.Warn("oversized text packet dropped", "server", s.Name,
+				"cmd", p.Cmd, "id", id, "size", len(p.Body))
+			return
+		}
+		if p.Cmd == 0x194 {
+			s.forward(p, id, 0x195, toEveryoneInRoom)
+			return
+		}
 		switch {
 		case p.ID2 == 0:
 			s.forward(p, id, 0x197, toEveryone)
@@ -107,8 +120,11 @@ func (s *Server) handle(c Client, p protocol.Packet) {
 			return
 		}
 		pl := s.players[id]
-		if pl.Room != nil {
-			return // вже в кімнаті
+		// Після 0x1b5 (кік) зв'язок із кімнатою лишається — і в оригіналі теж.
+		// Знімаємо його тут, інакше гравець назавжди втратить змогу грати.
+		pl.LeaveRoom()
+		if _, taken := s.rooms[id]; taken {
+			return // кімната з таким хостом уже є
 		}
 		room := NewRoom(id, desc)
 		s.rooms[id] = room
@@ -134,9 +150,10 @@ func (s *Server) handle(c Client, p protocol.Packet) {
 			return
 		}
 		pl := s.players[id]
-		if pl.Room != nil {
-			return
+		if pl.Room == room {
+			return // вже в цій кімнаті
 		}
+		pl.LeaveRoom() // знімаємо залишковий зв'язок після кіку
 		pl.JoinRoom(room)
 
 		w := protocol.NewWriter()
