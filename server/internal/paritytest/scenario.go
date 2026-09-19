@@ -1,14 +1,28 @@
 // Package paritytest проганяє однаковий сценарій проти двох реалізацій
 // сервера й збирає отримані пакети для побайтового порівняння.
+//
+// Сценарій навмисно строго послідовний: кожна дія завершується очікуванням
+// пакета-підтвердження, перш ніж почнеться наступна. Інакше порівняння
+// побайтово не має сенсу — обидва сервери розсилають сповіщення всім
+// під'єднаним сокетам, тож те, чи встиг сервер зареєструвати щойно
+// прийняте з'єднання до розсилки, змінює кількість пакетів у клієнта.
 package paritytest
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/zeror5162-creator/cossacs/server/internal/protocol"
 )
+
+// settle — пауза, за яку сервер встигає розіслати наслідки однієї дії тим,
+// від кого ми не чекаємо явного підтвердження.
+const settle = 150 * time.Millisecond
+
+// ackTimeout — скільки чекаємо на пакет-підтвердження.
+const ackTimeout = 5 * time.Second
 
 type client struct {
 	name string
@@ -51,46 +65,86 @@ func (c *client) packets() []protocol.Packet {
 	return out
 }
 
-func (c *client) send(p protocol.Packet) {
-	c.conn.Write(protocol.Encode(p))
-	time.Sleep(120 * time.Millisecond) // даємо серверу розіслати наслідки
-}
-
-func (c *client) myID() uint32 {
+func (c *client) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.id
+	return len(c.recv)
 }
 
-func (c *client) login(nick string) {
+func (c *client) send(p protocol.Packet) {
+	c.conn.Write(protocol.Encode(p))
+	time.Sleep(settle) // даємо серверу розіслати наслідки
+}
+
+// waitFor чекає, доки клієнт отримає пакет із командою cmd, починаючи з
+// індексу from. Повертає помилку по таймауту, щоб сценарій падав із
+// зрозумілим повідомленням, а не мовчки розходився з еталоном.
+func (c *client) waitFor(cmd uint16, from int) error {
+	deadline := time.Now().Add(ackTimeout)
+	for {
+		c.mu.Lock()
+		for _, p := range c.recv[min(from, len(c.recv)):] {
+			if p.Cmd == cmd {
+				c.mu.Unlock()
+				return nil
+			}
+		}
+		c.mu.Unlock()
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s: no %#x within %s", c.name, cmd, ackTimeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (c *client) login(nick string) error {
+	from := c.count()
 	w := protocol.NewWriter()
 	w.String("1.0.0.7", protocol.LenByte)
 	w.String("2.0.7", protocol.LenByte)
 	w.String("a@b.c", protocol.LenByte)
 	w.String("", protocol.LenByte)
 	w.String(nick, protocol.LenByte)
-	c.send(w.Packet(0x19a, 0, 0))
+	c.conn.Write(protocol.Encode(w.Packet(0x19a, 0, 0)))
+	if err := c.waitFor(0x19b, from); err != nil {
+		return err
+	}
+	time.Sleep(settle) // 0x1a6 услід за 0x19b має дійти до всіх
+	return nil
+}
+
+// join під'єднує клієнта й одразу логінить його. Наступний клієнт
+// з'являється лише після того, як попередній повністю зайшов у лобі.
+func join(addr, name, nick string) (*client, error) {
+	c, err := dial(addr, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.login(nick); err != nil {
+		c.conn.Close()
+		return nil, err
+	}
+	return c, nil
 }
 
 // Run виконує сценарій: три гравці заходять, створюють кімнату, грають,
 // хост виходить під час гри (передача ролі), решта роз'єднується.
 func Run(addr string) (map[string][]protocol.Packet, error) {
-	host, err := dial(addr, "host")
+	host, err := join(addr, "host", "Host")
 	if err != nil {
 		return nil, err
 	}
-	g1, err := dial(addr, "guest1")
+	defer host.conn.Close()
+	g1, err := join(addr, "guest1", "Guest1")
 	if err != nil {
 		return nil, err
 	}
-	g2, err := dial(addr, "guest2")
+	defer g1.conn.Close()
+	g2, err := join(addr, "guest2", "Guest2")
 	if err != nil {
 		return nil, err
 	}
-
-	host.login("Host")
-	g1.login("Guest1")
-	g2.login("Guest2")
+	defer g2.conn.Close()
 
 	hostID := host.myID()
 
@@ -124,14 +178,23 @@ func Run(addr string) (map[string][]protocol.Packet, error) {
 	g1.send(protocol.Packet{Cmd: 0x460, ID1: g1.myID()})
 	host.send(protocol.Packet{Cmd: 0x1a0, ID1: hostID}) // хост виходить під час гри
 
-	time.Sleep(300 * time.Millisecond)
+	// Роз'єднуємо по одному: якщо закрити два сокети разом, порядок, у якому
+	// сервер помітить розриви, стає випадковим, і сповіщення 0x1a7 приходять
+	// у різному порядку на різних прогонах.
 	host.conn.Close()
+	time.Sleep(settle)
 	g1.conn.Close()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(settle)
 	g2.conn.Close()
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(settle)
 
 	return map[string][]protocol.Packet{
 		"host": host.packets(), "guest1": g1.packets(), "guest2": g2.packets(),
 	}, nil
+}
+
+func (c *client) myID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.id
 }
